@@ -2,7 +2,7 @@ import re
 import streamlit as st
 import pandas as pd
 import requests
-from io import BytesIO, StringIO, BytesIO as BIO
+from io import BytesIO, StringIO
 from datetime import date, datetime, timedelta
 from requests.auth import HTTPBasicAuth
 
@@ -213,15 +213,18 @@ def color_diff_inverted(val):
 def fetch_ga4_items(property_id: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     Pobiera itemsViewed i itemRevenue z GA4 dla zakresu dat.
-    Wymiar: itemId.
-    Zwraca DataFrame z kolumnami: itemId, itemsViewed, itemRevenue.
+    Wymiary: itemId (= ID produktu) oraz customItem:item_sku (= Index/SKU).
+    Zwraca DataFrame z kolumnami: ga4_itemId, ga4_sku, itemsViewed, itemRevenue.
     """
     if ga4_client is None:
         return pd.DataFrame()
     try:
         request = RunReportRequest(
             property=f"properties/{property_id}",
-            dimensions=[Dimension(name="itemId")],
+            dimensions=[
+                Dimension(name="itemId"),
+                Dimension(name="customItem:item_sku"),
+            ],
             metrics=[
                 Metric(name="itemsViewed"),
                 Metric(name="itemRevenue"),
@@ -232,11 +235,16 @@ def fetch_ga4_items(property_id: str, start_date: str, end_date: str) -> pd.Data
         rows = []
         for row in response.rows:
             rows.append({
-                "itemId":       row.dimension_values[0].value,
-                "itemsViewed":  float(row.metric_values[0].value),
-                "itemRevenue":  float(row.metric_values[1].value),
+                "ga4_itemId":  row.dimension_values[0].value,
+                "ga4_sku":     row.dimension_values[1].value,
+                "itemsViewed": float(row.metric_values[0].value),
+                "itemRevenue": float(row.metric_values[1].value),
             })
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["ga4_itemId"] = df["ga4_itemId"].astype(str).str.strip().str.upper()
+            df["ga4_sku"]    = df["ga4_sku"].astype(str).str.strip().str.upper()
+        return df
     except Exception as e:
         st.warning(f"GA4 błąd dla property {property_id}: {e}")
         return pd.DataFrame()
@@ -246,7 +254,7 @@ def build_ga4_for_mpk(mpk_code: str) -> pd.DataFrame:
     """
     Dla danego MPK pobiera dane GA4 za 7 i 30 dni.
     Zwraca DataFrame z kolumnami:
-      itemId,
+      ga4_itemId, ga4_sku,
       itemsViewed_7d, itemRevenue_7d,
       itemsViewed_30d, itemRevenue_30d,
       itemsViewed_Diff, itemsViewed_Diff_%,
@@ -277,16 +285,18 @@ def build_ga4_for_mpk(mpk_code: str) -> pd.DataFrame:
     if not df30.empty:
         df30 = df30.rename(columns=rename30)
 
+    id_cols = ["ga4_itemId", "ga4_sku"]
+
     if df7.empty:
-        merged = df30
-        for c in ["itemsViewed_7d", "itemRevenue_7d"]:
-            merged[c] = 0.0
+        merged = df30.copy()
+        merged["itemsViewed_7d"] = 0.0
+        merged["itemRevenue_7d"] = 0.0
     elif df30.empty:
-        merged = df7
-        for c in ["itemsViewed_30d", "itemRevenue_30d"]:
-            merged[c] = 0.0
+        merged = df7.copy()
+        merged["itemsViewed_30d"] = 0.0
+        merged["itemRevenue_30d"] = 0.0
     else:
-        merged = pd.merge(df7, df30, on="itemId", how="outer").fillna(0)
+        merged = pd.merge(df7, df30, on=id_cols, how="outer").fillna(0)
 
     # Oblicz różnicę 7d vs 30d
     for metric in ["itemsViewed", "itemRevenue"]:
@@ -297,7 +307,6 @@ def build_ga4_for_mpk(mpk_code: str) -> pd.DataFrame:
             lambda r, c7=c7, c30=c30: pct_diff(r[c7], r[c30]), axis=1
         )
 
-    merged["itemId"] = merged["itemId"].astype(str).str.strip().str.upper()
     return merged
 
 
@@ -375,6 +384,9 @@ for shop_name in selected_shops:
             axis=1
         )
 
+        if 'Index' in df.columns:
+            df['Index'] = df['Index'].astype(str).str.strip().str.upper()
+
         shop_data[shop_name] = df
 
 # ────────────────────────────────────────────────────────────
@@ -391,44 +403,81 @@ for shop_name in selected_shops:
 
 # ────────────────────────────────────────────────────────────
 # SCALENIE GA4 Z DANYMI CSV
-# Łączymy najpierw po Index, potem po ID (fallback)
+# Próba 1: CSV.Index  ↔ GA4.ga4_sku  (customItem:item_sku)
+# Próba 2: CSV.ID     ↔ GA4.ga4_itemId
 # ────────────────────────────────────────────────────────────
 
+GA4_METRIC_COLS = [
+    "itemsViewed_7d", "itemRevenue_7d",
+    "itemsViewed_30d", "itemRevenue_30d",
+    "itemsViewed_Diff", "itemsViewed_Diff_%",
+    "itemRevenue_Diff", "itemRevenue_Diff_%",
+]
+
+
 def merge_with_ga4(df: pd.DataFrame, mpk_code: str) -> pd.DataFrame:
-    """Dołącza kolumny GA4 do df cenowego dla danego MPK."""
+    """
+    Łączy dane cenowe z GA4:
+      1. CSV.Index  ↔  GA4.ga4_sku  (customItem:item_sku)
+      2. CSV.ID     ↔  GA4.ga4_itemId  (fallback)
+    """
     if mpk_code not in ga4_data:
-        # Dodaj puste kolumny żeby tabela była spójna
-        for c in ["itemsViewed_7d", "itemRevenue_7d",
-                  "itemsViewed_30d", "itemRevenue_30d",
-                  "itemsViewed_Diff", "itemsViewed_Diff_%",
-                  "itemRevenue_Diff", "itemRevenue_Diff_%"]:
+        for c in GA4_METRIC_COLS:
             df[c] = None
         return df
 
     ga4 = ga4_data[mpk_code].copy()
 
-    # Próba 1: łącz po Index
-    if 'Index' in df.columns:
-        df_idx = df.copy()
-        df_idx['_join_key'] = df_idx['Index'].astype(str).str.strip().str.upper()
-        ga4['_join_key']    = ga4['itemId']
-        merged = pd.merge(df_idx, ga4.drop(columns=['itemId']), on='_join_key', how='left')
-        matched = merged[ga4.drop(columns=['itemId']).columns[0]].notna().sum() if len(ga4.drop(columns=['itemId']).columns) > 0 else 0
-        merged.drop(columns=['_join_key'], inplace=True)
+    df_out = df.copy()
+    df_out['_csv_index'] = (
+        df_out['Index'].astype(str).str.strip().str.upper()
+        if 'Index' in df_out.columns else ''
+    )
+    df_out['_csv_id'] = df_out['ID'].astype(str).str.strip().str.upper()
 
-        # Jeśli Index dał ≥1 trafienie — OK
-        ga4_metric_cols = [c for c in ga4.columns if c != 'itemId']
-        hit_count = merged[ga4_metric_cols[0]].notna().sum() if ga4_metric_cols else 0
+    # ── Próba 1: Index ↔ ga4_sku ──────────────────────────────
+    ga4_by_sku = (
+        ga4.drop(columns=['ga4_itemId'])
+           .rename(columns={'ga4_sku': '_join_key'})
+    )
+    merged = pd.merge(
+        df_out,
+        ga4_by_sku,
+        left_on='_csv_index',
+        right_on='_join_key',
+        how='left'
+    ).drop(columns=['_join_key'], errors='ignore')
 
-        if hit_count > 0:
-            return merged
+    hit_count = merged[GA4_METRIC_COLS[0]].notna().sum()
 
-    # Próba 2: łącz po ID
-    df_id = df.copy()
-    df_id['_join_key'] = df_id['ID'].astype(str).str.strip().str.upper()
-    ga4['_join_key']   = ga4['itemId']
-    merged = pd.merge(df_id, ga4.drop(columns=['itemId']), on='_join_key', how='left')
-    merged.drop(columns=['_join_key'], inplace=True)
+    if hit_count > 0:
+        merged.drop(columns=['_csv_index', '_csv_id'], inplace=True, errors='ignore')
+        return merged
+
+    # ── Próba 2: ID ↔ ga4_itemId ──────────────────────────────
+    ga4_by_id = (
+        ga4.drop(columns=['ga4_sku'])
+           .rename(columns={'ga4_itemId': '_join_key'})
+    )
+    merged = pd.merge(
+        df_out,
+        ga4_by_id,
+        left_on='_csv_id',
+        right_on='_join_key',
+        how='left'
+    ).drop(columns=['_join_key'], errors='ignore')
+
+    hit_count = merged[GA4_METRIC_COLS[0]].notna().sum()
+    if hit_count == 0:
+        st.warning(
+            f"⚠️ GA4 dla {mpk_code}: brak trafień po SKU ani itemId.\n"
+            f"GA4 ga4_sku przykład: {ga4['ga4_sku'].head(3).tolist()} | "
+            f"GA4 ga4_itemId przykład: {ga4['ga4_itemId'].head(3).tolist()} | "
+            f"CSV Index przykład: {df['Index'].head(3).tolist() if 'Index' in df.columns else 'brak'} | "
+            f"CSV ID przykład: {df['ID'].head(3).tolist()}"
+        )
+
+    merged.drop(columns=['_csv_index', '_csv_id'], inplace=True, errors='ignore')
     return merged
 
 
@@ -441,12 +490,7 @@ for shop_name in selected_shops:
 # BUDOWANIE TABELI WYNIKOWEJ
 # ────────────────────────────────────────────────────────────
 
-GA4_COLS = [
-    "itemsViewed_7d", "itemRevenue_7d",
-    "itemsViewed_30d", "itemRevenue_30d",
-    "itemsViewed_Diff", "itemsViewed_Diff_%",
-    "itemRevenue_Diff", "itemRevenue_Diff_%",
-]
+GA4_COLS = GA4_METRIC_COLS  # alias dla czytelności
 
 INFO_COLS = ['Index', 'ID', 'ProductName', 'Brand', 'CategoryName', 'Seasonality']
 
@@ -523,14 +567,12 @@ else:  # 2 sklepy
     }
 
     # GA4 kolumny — dla trybu 2-sklepowego bierzemy dane z mpk1 (sklep bazowy)
-    # GA4 kolumny mają sufiks _{mpk1} po merge, więc je wyciągamy
     for ga4c in GA4_COLS:
         col_with_suffix = f'{ga4c}_{mpk1}'
         if col_with_suffix in merged.columns:
             result_dict[ga4c] = merged[col_with_suffix]
         elif ga4c in merged.columns:
             result_dict[ga4c] = merged[ga4c]
-        # jeśli brak — kolumna nie trafia do wyniku (nie ma GA4 dla tego MPK)
 
     result_final = pd.DataFrame(result_dict)
 
@@ -668,12 +710,12 @@ if filtered_df is not None and not filtered_df.empty:
     styled = styled.format(format_rules, na_rep='—')
 
     pinned_config = {
-        "Index":       st.column_config.Column(pinned=True),
-        "ID":          st.column_config.Column(pinned=True),
-        "ProductName": st.column_config.Column(pinned=True),
-        "Brand":       st.column_config.Column(pinned=True),
-        "CategoryName":st.column_config.Column(pinned=True),
-        "Seasonality": st.column_config.Column(pinned=True),
+        "Index":        st.column_config.Column(pinned=True),
+        "ID":           st.column_config.Column(pinned=True),
+        "ProductName":  st.column_config.Column(pinned=True),
+        "Brand":        st.column_config.Column(pinned=True),
+        "CategoryName": st.column_config.Column(pinned=True),
+        "Seasonality":  st.column_config.Column(pinned=True),
     }
 
     st.dataframe(
