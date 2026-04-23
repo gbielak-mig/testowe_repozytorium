@@ -219,11 +219,6 @@ def color_diff_inverted(val):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_ga4_items(property_id: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    Pobiera itemsViewed i itemRevenue z GA4.
-    Wymiary: itemId (= ID produktu) oraz customItem:item_sku (= Index/SKU).
-    Zwraca DataFrame z kolumnami: ga4_itemId, ga4_sku, itemsViewed, itemRevenue.
-    """
     if ga4_client is None:
         return pd.DataFrame()
     try:
@@ -259,13 +254,6 @@ def fetch_ga4_items(property_id: str, start_date: str, end_date: str) -> pd.Data
 
 
 def build_ga4_for_mpk(mpk_code: str) -> pd.DataFrame:
-    """
-    Dla danego MPK pobiera dane GA4 za 7 i 30 dni.
-    Zwraca DataFrame z kolumnami:
-      ga4_itemId, ga4_sku,
-      itemsViewed_7d, itemRevenue_7d,
-      itemsViewed_30d, itemRevenue_30d
-    """
     property_id = GA4_PROPERTIES.get(mpk_code)
     if not property_id:
         return pd.DataFrame()
@@ -305,15 +293,6 @@ def build_ga4_for_mpk(mpk_code: str) -> pd.DataFrame:
 
 
 def merge_with_ga4(df: pd.DataFrame, mpk_code: str) -> pd.DataFrame:
-    """
-    Dołącza kolumny GA4 do df cenowego z sufiksem _{mpk_code}:
-      itemsViewed_7d_{mpk}, itemRevenue_7d_{mpk},
-      itemsViewed_30d_{mpk}, itemRevenue_30d_{mpk}
-
-    Łączenie:
-      1. CSV.Index  ↔  GA4.ga4_sku  (customItem:item_sku)
-      2. CSV.ID     ↔  GA4.ga4_itemId  (fallback)
-    """
     target_cols = [f"{m}_{mpk_code}" for m in GA4_BASE_METRICS]
 
     if mpk_code not in ga4_data:
@@ -322,7 +301,6 @@ def merge_with_ga4(df: pd.DataFrame, mpk_code: str) -> pd.DataFrame:
         return df
 
     ga4 = ga4_data[mpk_code].copy()
-    # Dodaj sufiks MPK do nazw metryk
     ga4 = ga4.rename(columns={m: f"{m}_{mpk_code}" for m in GA4_BASE_METRICS})
 
     df_out = df.copy()
@@ -471,7 +449,6 @@ for shop_name in selected_shops:
 
 # ────────────────────────────────────────────────────────────
 # SCALENIE GA4 Z DANYMI CSV
-# Wynikowe kolumny: {metric}_{mpk}, np. itemsViewed_7d_S500
 # ────────────────────────────────────────────────────────────
 
 for shop_name in selected_shops:
@@ -489,7 +466,6 @@ if len(selected_shops) == 1:
     mpk_code = get_mpk_code(sn)
     df       = shop_data[sn]
 
-    # GA4 kolumny z sufiksem MPK, zaraz po Price
     ga4_cols_1 = [f"{m}_{mpk_code}" for m in GA4_BASE_METRICS
                   if f"{m}_{mpk_code}" in df.columns]
 
@@ -535,13 +511,8 @@ else:  # 2 sklepy
     else:
         id_val = pick('ID')
 
-    # ── Helper: znajdź kolumnę GA4 w merged (pd.merge mógł dodać dodatkowy sufiks) ──
+    # ── Helper: znajdź kolumnę GA4 w merged ──
     def get_ga4_col(base_metric, mpk):
-        """
-        Szuka kolumny {base_metric}_{mpk} w merged.
-        Po pd.merge z suffixes kolumna mogła dostać dodatkowy sufiks,
-        np. itemsViewed_7d_S500_S500 — bierzemy pierwszy pasujący.
-        """
         exact = f"{base_metric}_{mpk}"
         if exact in merged.columns:
             return merged[exact]
@@ -549,6 +520,24 @@ else:  # 2 sklepy
             if col.startswith(f"{base_metric}_{mpk}"):
                 return merged[col]
         return None
+
+    # ── Helper: oblicz % różnicę GA4 między MPK1 i MPK2 ──
+    def ga4_pct_diff_series(base_metric):
+        """
+        Zwraca Series z % różnicą: (MPK1 - MPK2) / MPK2 * 100.
+        Gdy MPK2 == 0, zwraca None.
+        """
+        s1 = get_ga4_col(base_metric, mpk1)
+        s2 = get_ga4_col(base_metric, mpk2)
+        if s1 is None or s2 is None:
+            return None
+        s1 = pd.to_numeric(s1, errors='coerce').fillna(0)
+        s2 = pd.to_numeric(s2, errors='coerce').fillna(0)
+        result = s1.copy().astype(float)
+        mask = s2 != 0
+        result[mask]  = ((s1[mask] - s2[mask]) / s2[mask] * 100).round(2)
+        result[~mask] = None
+        return result
 
     result_dict = {
         'Index':        merged['Index'],
@@ -564,16 +553,22 @@ else:  # 2 sklepy
         'Price_Diff_%':   merged['Price_Diff_Pct'],
     }
 
-    # ── GA4 zaraz po cenie: kolejność MPK1 → MPK2 dla każdej metryki ──
-    # Kolumny: itemsViewed_7d_MPK1, itemsViewed_7d_MPK2,
-    #          itemRevenue_7d_MPK1, itemRevenue_7d_MPK2,
-    #          itemsViewed_30d_MPK1, itemsViewed_30d_MPK2,
-    #          itemRevenue_30d_MPK1, itemRevenue_30d_MPK2
+    # ── GA4: dla każdej metryki: MPK1, MPK2, % różnica ──
+    # Kolejność kolumn: itemsViewed_7d_MPK1, itemsViewed_7d_MPK2, itemsViewed_7d_Diff_%,
+    #                   itemRevenue_7d_MPK1,  itemRevenue_7d_MPK2,  itemRevenue_7d_Diff_%,
+    #                   itemsViewed_30d_MPK1, itemsViewed_30d_MPK2, itemsViewed_30d_Diff_%,
+    #                   itemRevenue_30d_MPK1, itemRevenue_30d_MPK2, itemRevenue_30d_Diff_%
     for base in GA4_BASE_METRICS:
-        for mpk in [mpk1, mpk2]:
-            col_name = f"{base}_{mpk}"
-            val = get_ga4_col(base, mpk)
-            result_dict[col_name] = val if val is not None else None
+        col_m1   = f"{base}_{mpk1}"
+        col_m2   = f"{base}_{mpk2}"
+        col_diff = f"{base}_Diff_%"
+
+        val1 = get_ga4_col(base, mpk1)
+        val2 = get_ga4_col(base, mpk2)
+
+        result_dict[col_m1]   = val1 if val1 is not None else None
+        result_dict[col_m2]   = val2 if val2 is not None else None
+        result_dict[col_diff] = ga4_pct_diff_series(base)
 
     # ── Pozostałe metryki ──
     result_dict.update({
